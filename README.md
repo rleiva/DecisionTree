@@ -1,4 +1,4 @@
-# DecisionTree
+# Decision Trees
 
 Implementation of decision trees based on the minimum nescience principle.
 
