@@ -1,12 +1,12 @@
 """
-Build a binary tree for classification and regression
+Build a binary tree for classification and regression problems
 based on the minimum nescience principle
 
 @author:    Rafael Garcia Leiva
 @mail:      rgarcialeiva@gmail.com
 @web:       http://www.mathematicsunknown.com/
 @copyright: GNU GPLv3
-@version:   1.4 (Nov 2020)
+@version:   1.6 (Jun 2021)
 """
 
 import numpy  as np
@@ -18,6 +18,7 @@ import copy
 import math
 
 from joblib import Parallel, delayed
+from collections import defaultdict
 
 from sklearn.utils.validation import check_is_fitted
 from sklearn.preprocessing    import LabelEncoder
@@ -26,6 +27,14 @@ from sklearn.preprocessing    import KBinsDiscretizer
 from sklearn.base import BaseEstimator 
 from sklearn.base import ClassifierMixin
 from sklearn.base import RegressorMixin
+
+# Constants
+CONSTANT_FEATURE    = -1    # Attribute is constant
+NO_SPLIT_FOUND      = -2    # No suitable split has been found for attribute
+CAN_BE_DEVELOPED    = -3    # Node cannot be futher develped
+CANNOT_BE_DEVELOPED = -4    # Node can be developed
+
+DEBUG = True    # Print addtional information
 
 class NescienceDecisionTree(BaseEstimator):
     """
@@ -52,31 +61,33 @@ class NescienceDecisionTree(BaseEstimator):
 
     Each node of the tree is a dictionary with the following structure:
 
-        * attribute - index of the column of the attribute
-        * value     - value for the split
-        * operator  - either '<' or '='
-        * left      - left branch (dict with same structure)
-                      None if it is a leaf node
-        * _left     - cache for left branch
-        * right     - right branch (dict with same structure)
-                      None if it is a leaf node
-        * _right    - cache for right branch
-        * lindices  - indices of current rows for left branch 
-                      None if it is an intermediate node
-        * rindices  - indices of current rows for right branch
-                      None if it is an intermediate node
-        * lforecast - forecasted value for the letf side
-        * rforecast - forecasted value for the right side        
+        * attribute  - index of the column of the attribute
+        * value      - value for the split
+        * operator   - either '<' or '='
+        * left       - left branch (dict with same structure)
+                       CANNOT_BE_DEVELOPED if it is a leaf node
+        * _left      - cache for left branch
+        * right      - right branch (dict with same structure)
+                       CANNOT_BE_DEVELOPED if it is a leaf node
+        * _right     - cache for right branch
+        * lindices   - indices of current rows for left branch 
+                       None if it is an intermediate node
+        * rindices   - indices of current rows for right branch
+                       None if it is an intermediate node
+        * lforecast  - forecasted value for the letf side
+        * rforecast  - forecasted value for the right side
     """
     
-    def __init__(self, mode="regression", cleanup=True, verbose=False, n_jobs=1):
+    def __init__(self, mode="regression", cleanup=True, partial_miscoding=True, early_stop=True, verbose=False, n_jobs=1):
         """
         Initialization of the tree
 
-          * mode (string)  : Type of target problem, "regression" or "classification"
-          * cleanup(bool)  : If redundant leaf nodes are removed from final tree
-          * n_jobs (int)   : Number of concurrent jobs
-          * verbose (bool) : If True, prints out additional information
+          * mode (string)     : Type of target problem, "regression" or "classification"
+          * cleanup(bool)     : If True, redundant leaf nodes are removed from final tree
+          * n_jobs (int)      : Number of concurrent jobs
+          * partial_miscoding : use partial miscoding instead of adjusted miscoding
+          * early_stop        : stop the algorithm as soon as a good solution has been found
+          * verbose (bool)    : If True, prints out additional information
         """
         
         valid_modes = ("regression", "classification")
@@ -91,11 +102,13 @@ class NescienceDecisionTree(BaseEstimator):
         else:
             self.isRegression = False
 
-        self.cleanup = cleanup
-        self.n_jobs  = n_jobs
-        self.verbose = verbose
+        self.cleanup           = cleanup
+        self.partial_miscoding = partial_miscoding
+        self.early_stop        = early_stop
+        self.n_jobs            = n_jobs
+        self.verbose           = verbose
     
-        
+    
     def fit(self, X, y):
         """
         Fit a tree given a dataset
@@ -111,8 +124,6 @@ class NescienceDecisionTree(BaseEstimator):
         Return the fitted model
         """
 
-        self.X_ = X
-
         self.X_ = np.array(X)
         self.y_ = np.array(y)
 
@@ -123,52 +134,69 @@ class NescienceDecisionTree(BaseEstimator):
 
         if self.isRegression:
             # Discretize target values
-            self.discretizer = self._discretizer(self.y_.reshape(-1, 1))
-            self.y_ = self.discretizer.transform(self.y_.reshape(-1, 1))[:,0].astype(dtype=int)
-            self.classes_ = np.unique(self.discretizer.inverse_transform(self.y_.reshape(-1, 1)))
+            discretizer = self._discretizer(self.y_.reshape(-1, 1))
+            self.y_ = discretizer.transform(self.y_.reshape(-1, 1))[:,0].astype(dtype=int)
+            self.classes_ = np.unique(discretizer.inverse_transform(self.y_.reshape(-1, 1)))
+            classes, self.y_, count = np.unique(self.y_, return_inverse=True, return_counts=True)
         else:
             # No discretization needed
             self.discretizer = None
             # Transform categorial values into numbers
-            self.classes_, self.y_ = np.unique(y, return_inverse=True)
-        
-        self.n_classes = self.classes_.shape[0]
+            self.classes_, self.y_, count = np.unique(y, return_inverse=True, return_counts=True)
+
+        self.n_classes = len(self.classes_)
 
         # Compute the optimal code lengths for the response values
-        self.code     = self._code_lengths()
-        self.length_y = np.sum(self.code[self.y_])
+        self.length_y = 0
+        for i in np.arange(self.n_classes):
+            self.length_y = self.length_y - np.log2( count[i] / len(self.y_) ) * count[i]
 
         # Compute the contribution of each attribute to miscoding
-        self.miscoding = self._attributes_miscoding()
-        self.miscoding = 1 - self.miscoding
-        self.miscoding = self.miscoding / np.sum(self.miscoding)
+        regular  = self._attributes_miscoding()
+        adjusted = 1 - regular
+        adjusted = adjusted / np.sum(adjusted)
+        if self.partial_miscoding:
+            self.miscoding = adjusted - regular / np.sum(regular)
+        else:
+            self.miscoding = adjusted
 
         # Create the initial node
-        indices          = np.arange(self.X_.shape[0])  # Start with the full dataset
-        self.root_       = self._create_node(indices)
-        self.best_tree   = copy.deepcopy(self.root_)
+        indices        = np.arange(self.X_.shape[0])  # Start with the full dataset
+        constants      = np.array([False] * self.X_.shape[1]) # Attribute known to be constant
+        self.root_     = self._create_node(indices, constants)
+        self.best_tree = copy.deepcopy(self.root_)
 
         # Compute y_hat
-        self.y_hat = np.zeros(len(self.y_))
-        self.y_hat[self.root_['lindices']] = self.root_['lforecast']
-        self.y_hat[self.root_['rindices']] = self.root_['rforecast']
+        self.y_hat_ = np.zeros(len(self.y_))
+        self.y_hat_[self.root_['lindices']] = self.root_['lforecast']
+        self.y_hat_[self.root_['rindices']] = self.root_['rforecast']
         
+        # Initial variables in use
+        self.var_in_use_ = np.zeros(self.X_.shape[1])
+        self.var_in_use_[self.root_['attribute']] = 1
+
         # Intial nescience
-        self.nescience_  = self._nescience()
+        self.nescience_ = self._nescience()
 
         # List of candidate nodes to growth        
         self.nodesList = list()
         self.nodesList.append(self.root_)
         
+        if DEBUG:
+            print("Miscoding: ",  self._miscoding(), 
+                  "Inaccuracy: ", self._inaccuracy(),
+                  "Surfeit: ",    self._surfeit(),
+                  "Nescience: ",  self._nescience())
+            print(self._tree2str())
+
         if self.verbose:
-            print("Miscoding: ", self._miscoding(), "Inaccuracy: ", self._inaccuracy(self.y_hat), "Surfeit: ", self._surfeit(), "Nescience: ", self._nescience())            
+            print("Best Nescience:",   self.nescience_)           
 
         # Build the tree
         self._fit()
 
         # Print out the best nescience achieved
         if self.verbose:
-            print("Final nescience: " + str(self._nescience()))
             print(self._tree2str())
 
         return self
@@ -192,76 +220,80 @@ class NescienceDecisionTree(BaseEstimator):
                             
                 # Get current node
                 node = self.nodesList[i]
+
+                # Control if the node can be developed
                 left_side  = False
                 right_side = False
             
                 # Try to create a left node if empty
-                if node['left'] is None:
+                if node['left'] == CAN_BE_DEVELOPED:
                     
                     # Create the node, or get it from the cache
-                    if node['_left'] is None:
-                        node['left']  = self._create_node(node['lindices'])
-                        node['_left'] = node['left']
+                    if node['_left'] == CAN_BE_DEVELOPED:
+                        node['left']  = self._create_node(node['lindices'], node['constants'])
                     else:
                         node['left']  = node['_left']
                                     
                     # Check if the node was created
-                    if node['left'] is not None:
+                    if node['left'] != CANNOT_BE_DEVELOPED:
 
                         # Left side can be developed
                         left_side = True
 
+                        # Save node in cache
+                        node['_left'] = node['left']
+
                         # Compute y_hat
-                        y_hat = self.y_hat.copy()
+                        y_hat = self.y_hat_.copy()
                         y_hat[node['left']['lindices']] = node['left']['lforecast']
                         y_hat[node['left']['rindices']] = node['left']['rforecast']
                         
-                        nsc = self._nescience(y_hat)
+                        nsc = self._nescience(y_hat=y_hat, attr=node['left']['attribute'])
                                                 
                         # Save data if nescience has been reduced                        
                         if nsc < best_nsc:                                
                             best_nsc   = nsc
                             best_node  = i
                             best_side  = "left"
-                            # TODO: Use cache node instead
                             left       = node['left']
                             
                         # And remove the node
-                        node['left'] = None
+                        node['left'] = CAN_BE_DEVELOPED
 
                 # Try to create a right node if empty
-                if node['right'] is None:
+                if node['right'] == CAN_BE_DEVELOPED:
                                 
                     # Create the node, or get it from the cache
-                    if node['_right'] is None:
-                        node['right']  = self._create_node(node['rindices'])
-                        node['_right'] = node['right']
+                    if node['_right'] == CAN_BE_DEVELOPED:
+                        node['right']  = self._create_node(node['rindices'], node['constants'])
                     else:                       
                         node['right']  = node['_right']
                 
                     # Check if the node was created
-                    if node['right'] is not None:
+                    if node['right'] != CANNOT_BE_DEVELOPED:
 
                         # Right side can be developed
                         right_side = True
 
+                        # Save node in cache
+                        node['_right'] = node['right']
+
                         # Compute y_hat
-                        y_hat = self.y_hat.copy()
+                        y_hat = self.y_hat_.copy()
                         y_hat[node['right']['lindices']] = node['right']['lforecast']
                         y_hat[node['right']['rindices']] = node['right']['rforecast']
                         
-                        nsc = self._nescience(y_hat)
+                        nsc = self._nescience(y_hat=y_hat, attr=node['right']['attribute'])
 
                         # Save data if nescience has been reduced                        
                         if nsc < best_nsc:                                
                             best_nsc   = nsc
                             best_node  = i
                             best_side  = "right"
-                            # TODO: Use cached node instead
                             right      = node['right']
                             
                         # And remove the node
-                        node['right'] = None
+                        node['right'] = CAN_BE_DEVELOPED
 
                 # Mark the node if it cannot be developed
                 if (left_side == False) and (right_side == False):
@@ -278,21 +310,23 @@ class NescienceDecisionTree(BaseEstimator):
                 if best_side == "left":
                     node['left'] = left
                     self.nodesList.append(node['left'])
-                    # Update y_hat
-                    self.y_hat[node['left']['lindices']] = node['left']['lforecast']
-                    self.y_hat[node['left']['rindices']] = node['left']['rforecast']
+                    # Update pre-computed values
+                    self.y_hat_[node['left']['lindices']] = node['left']['lforecast']
+                    self.y_hat_[node['left']['rindices']] = node['left']['rforecast']
+                    self.var_in_use_[node['left']['attribute']] = 1
                     # Save space
                     node['lindices'] = None
-                    node['_left']    = None
+                    node['_left']    = CANNOT_BE_DEVELOPED
                 else:
                     node['right'] = right
                     self.nodesList.append(node['right'])
                     # Update y_hat
-                    self.y_hat[node['right']['lindices']] = node['right']['lforecast']
-                    self.y_hat[node['right']['rindices']] = node['right']['rforecast']                
+                    self.y_hat_[node['right']['lindices']] = node['right']['lforecast']
+                    self.y_hat_[node['right']['rindices']] = node['right']['rforecast']
+                    self.var_in_use_[node['right']['attribute']] = 1
                     # Save space
                     node['rindices'] = None
-                    node['_right']   = None
+                    node['_right']   = CANNOT_BE_DEVELOPED
 
             # Clean up the list of nodes
             self.nodesList = [node for node in self.nodesList if node]
@@ -301,14 +335,28 @@ class NescienceDecisionTree(BaseEstimator):
             if best_nsc < self.nescience_:
                 # Update the best values
                 self.nescience_ = best_nsc
-                self.best_tree = copy.deepcopy(self.root_)
+                self.best_tree  = copy.deepcopy(self.root_)
+
+                if self.verbose:
+                    print("Best Nescience:",   self.nescience_)
+
+            else:
+                # Stop if the user only wants a good enougth solution
+                if self.early_stop:
+                    # Avoid the inestability of inaccuracy
+                    if self._inaccuracy() < self._surfeit():
+                        break
                             
-            if self.verbose:
-                print("Miscoding: ", self._miscoding(), "Inaccuracy: ", self._inaccuracy(self.y_hat), "Surfeit: ", self._surfeit(), "Nescience: ", self._nescience())
-                
+            if DEBUG:
+                print("Miscoding: ",  self._miscoding(), 
+                      "Inaccuracy: ", self._inaccuracy(),
+                      "Surfeit: ",    self._surfeit(),
+                      "Nescience: ",  self._nescience())
+
         # -> end while
 
         self.root_ = self.best_tree
+        self.pc_miscoding = self._miscoding()
 
         # There are no more nodes to growth, clean up the final tree
         if self.cleanup:
@@ -329,16 +377,17 @@ class NescienceDecisionTree(BaseEstimator):
     
         Returns
         -------
-        A list with the classes predicted
+        A list with the classes or values predicted
         """
         
         check_is_fitted(self)
         
+        X_ = np.array(X)
         y = list()
         
         # For each entry in the dataset
-        for i in np.arange(len(X)):
-            y.append(self.classes_[self._forecast(self.root_, X[i])])
+        for i in np.arange(len(X_)):
+            y.append(self.classes_[self._forecast(self.root_, X_[i])])
                 
         return y
 
@@ -359,11 +408,12 @@ class NescienceDecisionTree(BaseEstimator):
         
         check_is_fitted(self)
         
+        X_ = np.array(X)
         proba = list()
         
         # For each entry in the dataset
-        for i in np.arange(len(X)):
-            my_list = self._proba(self.root_, X[i])
+        for i in np.arange(len(X_)):
+            my_list = self._proba(self.root_, X_[i])
             proba.append(my_list)
             
         return np.array(proba)
@@ -423,6 +473,7 @@ class NescienceDecisionTree(BaseEstimator):
     ----------
     x1, x2: array-like, shape (n_samples)
     numeric1, numeric2: if the variable is numeric or not
+    double: return count for x1 and joint x1 and x2
        
     Returns
     -------
@@ -532,8 +583,8 @@ class NescienceDecisionTree(BaseEstimator):
 
             if actual_bins < optimal_bins:
                 # Too few intervals with data
+                add_bins      = optimal_bins - actual_bins
                 previous_bins = actual_bins
-                add_bins      = int( np.round( (length * (1 - actual_bins / optimal_bins)) / optimal_bins ) )
                 total_bins    = total_bins + add_bins
             else:
                 # All intervals have data
@@ -562,19 +613,6 @@ class NescienceDecisionTree(BaseEstimator):
         return new_x
 
 
-    """"
-    Compute the minimum length of a code to encode the response values y
-    """
-    def _code_lengths(self):
-  
-        unique, count = np.unique(self.y_, return_counts=True)
-        code  = np.zeros(self.n_classes)
-        for i in np.arange(self.n_classes):
-            code[unique[i]] = - np.log2( count[i] / len(self.y_) )
-            
-        return code
-
-
     """
     Compute the length of a list of attributes (1d or 2d)
     and / or a target variable (classification or regression)
@@ -585,6 +623,7 @@ class NescienceDecisionTree(BaseEstimator):
     ----------
     x1, x2: array-like, shape (n_samples)
     numeric1, numeric2: if the variable is numeric or not
+    dourble: return the optimal length for x1 and the joint x1 and x2
        
     Returns
     -------
@@ -646,12 +685,12 @@ class NescienceDecisionTree(BaseEstimator):
             if operator == '<':
 
                 if values[index] < value:
-                    if curr_node['left'] is not None:
+                    if curr_node['left'] != CAN_BE_DEVELOPED and curr_node['left'] != CANNOT_BE_DEVELOPED:
                         curr_node = curr_node['left']
                     else:
                         return curr_node['lforecast']
                 else:
-                    if curr_node['right'] is not None:
+                    if curr_node['right'] != CAN_BE_DEVELOPED and curr_node['right'] != CANNOT_BE_DEVELOPED:
                         curr_node = curr_node['right']
                     else:
                         return curr_node['rforecast']
@@ -659,12 +698,12 @@ class NescienceDecisionTree(BaseEstimator):
             else:    # operator is '='
 
                 if values[index] == value:
-                    if curr_node['left'] is not None:
+                    if curr_node['left'] != CAN_BE_DEVELOPED and curr_node['left'] != CANNOT_BE_DEVELOPED:
                         curr_node = curr_node['left']
                     else:
                         return node['lforecast']
                 else:
-                    if curr_node['right'] is not None:
+                    if curr_node['right'] != CAN_BE_DEVELOPED and curr_node['right'] != CANNOT_BE_DEVELOPED:
                         curr_node = curr_node['right']
                     else:
                         return node['rforecast']
@@ -684,34 +723,30 @@ class NescienceDecisionTree(BaseEstimator):
         if operator == '<':
 
             if values[index] < value:
-                if node['left'] is not None:
+                if node['left'] != CAN_BE_DEVELOPED and node['left'] != CANNOT_BE_DEVELOPED:
                     prob_list = self._proba(node['left'], values)
                     return prob_list
-
                 else:
                     indices = self.y_[node['lindices']]
             else:
-                if node['right'] is not None:
+                if node['right'] != CAN_BE_DEVELOPED and node['right'] != CANNOT_BE_DEVELOPED:
                     prob_list = self._proba(node['right'], values)
                     return prob_list
-
                 else:
                     indices = self.y_[node['rindices']]
 
         else:
 
             if values[index] != value:
-                if node['left'] is not None:
+                if node['left'] != CAN_BE_DEVELOPED and node['left'] != CANNOT_BE_DEVELOPED:
                     prob_list = self._proba(node['left'], values)
                     return prob_list
-
                 else:
                     indices = self.y_[node['lindices']]
             else:
-                if node['right'] is not None:
+                if node['right'] != CAN_BE_DEVELOPED and node['right'] != CANNOT_BE_DEVELOPED:
                     prob_list = self._proba(node['right'], values)
                     return prob_list
-
                 else:
                     indices = self.y_[node['rindices']]            
 
@@ -748,14 +783,14 @@ class NescienceDecisionTree(BaseEstimator):
     """
     def _varinuse(self, node):
                         
-        self.var_in_use[node['attribute']] = 1
+        self.var_in_use_[node['attribute']] = 1
         
         # Process left branch
-        if node['left'] is not None:
+        if node['left'] != CAN_BE_DEVELOPED and node['left'] != CANNOT_BE_DEVELOPED:
             self._varinuse(node['left'])
     
         # Process right branch    
-        if node['right'] is not None:
+        if node['right'] != CAN_BE_DEVELOPED and node['right'] != CANNOT_BE_DEVELOPED:
             self._varinuse(node['right'])
                 
         return
@@ -763,31 +798,47 @@ class NescienceDecisionTree(BaseEstimator):
     
     """
     Compute the global miscoding of the dataset used by the current tree
-      
+    
+    var_in_use: pre-computed attributes in use. If None, we compute the attributes using the current tree.
+
     Return the miscoding (float)
     """
-    def _miscoding(self):
-                    
-        self.var_in_use = np.zeros(self.X_.shape[1])
+    def _miscoding(self, attr=None):
+                
+        if attr is None:
+            # No attribute provided, compute variables in use
+            viu = self.var_in_use_
+            self.var_in_use_ = np.zeros(self.X_.shape[1])
+            self._varinuse(self.root_)
+            var_in_use = self.var_in_use_
+            self.var_in_use_ = viu
 
-        self._varinuse(self.root_)
+        else:
+            # Use the pre-computed variables in use
+            var_in_use = self.var_in_use_.copy()
+            var_in_use[attr] = 1
 
-        miscoding = np.dot(self.var_in_use, self.miscoding)
+        miscoding = np.dot(var_in_use, self.miscoding)
         miscoding = 1 - miscoding
                             
         return miscoding
 
 
     """
-    Compute global inaccuracy of the current tree
+    Compute the inaccuracy of the current tree
+
+    y_hat : pre-computed predictions. If None, we compute predictions using the current tree.
 
     Return the inaccuracy (float)
     """
-    def _inaccuracy(self, y_hat):
-                        
-        len_pred, len_joint   = self._optimal_code_length(x1=y_hat, numeric1=False,
-                                                          x2=self.y_, numeric2=False, double=True)
-        inacc       = ( len_joint - min(self.length_y, len_pred) ) / max(self.length_y, len_pred)
+    def _inaccuracy(self, y_hat=None):
+        
+        if y_hat is None:
+            y_hat = self.y_hat_
+
+        len_pred, len_joint = self._optimal_code_length(x1=y_hat, numeric1=False,
+                                                        x2=self.y_, numeric2=False, double=True)
+        inacc = ( len_joint - min(self.length_y, len_pred) ) / max(self.length_y, len_pred)
 
         return inacc 
 
@@ -801,7 +852,7 @@ class NescienceDecisionTree(BaseEstimator):
     
         # Compute the model string and its compressed version
         emodel = self._tree2str().encode()
-        compressed = zlib.compress(emodel, level=9)
+        compressed = zlib.compress(emodel, level=1)
         
         km = len(compressed)
         lm = len(emodel)
@@ -822,19 +873,33 @@ class NescienceDecisionTree(BaseEstimator):
 
 
     """
-    Compute the nescience of a tree
+    Compute the nescience of the current tree
+
+    * y_hat:   Use pre-computed y_hat, so that computation is faster
+    * attr:    Use pre-computed miscoding, so that computation is faster
+    * surfeit: Use pre-computed surfeit, so that computation is faster
               
     Return the nescience (float)
     """
-    def _nescience(self, y_hat=None):
+    def _nescience(self, y_hat=None, attr=None, surfeit=None):
 
-        miscoding  = self._miscoding()
-        surfeit    = self._surfeit()
+        # Use pre-computed value or compute new ones
 
         if y_hat is None:
-            inaccuracy = self._inaccuracy(self.y_hat)
+            inaccuracy = self._inaccuracy()
         else:
-            inaccuracy = self._inaccuracy(y_hat)            
+            inaccuracy = self._inaccuracy(y_hat)
+
+        if attr is None:
+            miscoding = self._miscoding()
+        else:
+            miscoding = self._miscoding(attr)
+
+        surfeit = self._surfeit()
+
+        # Avoid the inestability of inaccuracy            
+        if surfeit < inaccuracy:
+            surfeit = inaccuracy
 
         # Compute the nescience using an Euclidean distance
         nescience = math.sqrt(miscoding**2 + inaccuracy**2 + surfeit**2)
@@ -862,7 +927,7 @@ class NescienceDecisionTree(BaseEstimator):
         else:
             lindex = np.where(self.X_[:,attribute] == value)
 
-        lindices = np.intersect1d(indices, lindex)
+        lindices = np.intersect1d(indices, lindex, assume_unique=True)
         rindices = np.setdiff1d(indices, lindices, assume_unique=True)
 
         return lindices, rindices
@@ -876,7 +941,7 @@ class NescienceDecisionTree(BaseEstimator):
     
     Return a new node (dict)
     """   
-    def _create_node(self, indices):
+    def _create_node(self, indices, constant_features):
 
         best_inaccuracy = 10e6    # A large value
         best_attribute  = None
@@ -886,28 +951,58 @@ class NescienceDecisionTree(BaseEstimator):
         best_rindices   = None
         best_lforecast  = None
         best_rforecast  = None
+
+        my_constants = constant_features.copy()
         
         y = self.y_[indices]
-        clss, cnts = np.unique(y, return_counts=True)
-
-        # Do not split if all target points are equal    
-        if len(clss) <= 1:
-            return None
-
         X = self.X_[indices]
 
-        counts = np.zeros(self.n_classes)
-        counts[clss] = cnts
+        # Compute unique values and frequencies
+        counts = dict()
+        for i in range(len(y)):
+            try:
+                counts[y[i]] = counts[y[i]] + 1
+            except KeyError:
+                counts[y[i]] = 1
 
-        # Search for the best split in parallel
-        results = Parallel(n_jobs=self.n_jobs)(delayed(self._create_node_helper)(i, self.X_isNumeric[i], X[:,i], y, counts) for i in np.arange(self.X_.shape[1]))
+        # Do not split if all target points are equal
+        if len(counts.keys()) <= 1:
+            return CANNOT_BE_DEVELOPED
 
-        # Find the best split
+        # Search for the best split
+        if self.n_jobs != 1:
+
+            # In parallel
+            valid_jobs = list()
+            for i in np.arange(self.X_.shape[1]):
+                if self.miscoding[i] < 0:
+                    continue
+                if constant_features[i]:
+                   continue
+                valid_jobs.append(i)
+            results = Parallel(n_jobs=self.n_jobs)(delayed(self._create_node_helper)(i, self.X_isNumeric[i], X[:,i], y, counts) for i in valid_jobs)       
+
+        else:
+
+            # Sequential
+            results = list()
+            for i in np.arange(self.X_.shape[1]):
+                if self.miscoding[i] < 0:
+                    continue
+                if constant_features[i]:
+                    continue
+                results.append(self._create_node_helper(i, self.X_isNumeric[i], X[:,i], y, counts))
+
+        # Find out the best split
         for res in results:
 
-            if res is None:
+            if res == CONSTANT_FEATURE:
+                my_constants[i] == True
                 continue
 
+            if res == NO_SPLIT_FOUND:
+                continue
+            
             if res["inaccuracy"] < best_inaccuracy:
                 best_inaccuracy = res["inaccuracy"]
                 best_attribute  = res["attribute"]
@@ -916,7 +1011,7 @@ class NescienceDecisionTree(BaseEstimator):
 
         # Check if we have found a good split
         if best_attribute is None:
-            return None
+            return CANNOT_BE_DEVELOPED
 
         isnumeric = self.X_isNumeric[best_attribute]
         best_lindices, best_rindices = self._split_data(best_attribute, best_value, indices, isnumeric)
@@ -930,14 +1025,15 @@ class NescienceDecisionTree(BaseEstimator):
         my_dict = {'attribute': best_attribute,
                    'value':     best_value,
                    'operator':  best_operator,
-                   'left':      None,
-                   'right':     None,
-                   '_left':     None,
-                   '_right':    None,                   
+                   'left':      CAN_BE_DEVELOPED,
+                   'right':     CAN_BE_DEVELOPED,
+                   '_left':     CAN_BE_DEVELOPED,
+                   '_right':    CAN_BE_DEVELOPED,                   
                    'lindices':  best_lindices,
                    'rindices':  best_rindices,
                    'lforecast': best_lforecast,
-                   'rforecast': best_rforecast}
+                   'rforecast': best_rforecast,
+                   'constants': my_constants}
         
         return my_dict        
 
@@ -951,58 +1047,80 @@ class NescienceDecisionTree(BaseEstimator):
         best_i          = None
         best_value      = None
         best_operator   = None
-                                    
-        # Some datasets repeat values many times
-        values = np.unique(X)
-                            
-        # We cannot use this attribute if it has no possible splitting points
-        if len(values) <= 1:
-            return None
-
+                                                                
         # Create dictionaries to track the number of samples per class
-        l_categories = np.zeros(len(counts))
+        l_categories = defaultdict(int)
         r_categories = counts.copy()
 
-        # Search for the best splitting value      
+        # Some datasets repeat the same values many times
+        # values = set()
+
+        # countX[val, cat] is the number of times that X[j] == values[i] and y[j] == c
+        countX = defaultdict(dict) 
+        for i in range(len(X)):
+            # values.add(X[i])
+            try:
+                countX[X[i]][y[i]] = countX[X[i]][y[i]] + 1
+            except KeyError:
+                countX[X[i]][y[i]] = 1
+
+        # values = list(values)
+        values = list(dict.fromkeys(X))
+
+        # We cannot use this attribute if it has no possible splitting points
+        if len(values) <= 1:
+            return CONSTANT_FEATURE
+
+        # if isNumeric:
+        #     values = sorted(values)
+
+        # Search for the best splitting value
+        l_tot = 0
         for i in np.arange(len(values)):
-        
-            new_y = y[X == values[i]]
+
+            val = values[i]
 
             # Update the categories
             if not isNumeric:
-                l_categories = np.zeros(len(counts))
+                l_categories = defaultdict(int)
                 r_categories = counts.copy()
 
-            for j in np.arange(len(new_y)):
-                y_val = new_y[j]
-                l_categories[y_val] = l_categories[y_val] + 1
-                r_categories[y_val] = r_categories[y_val] - 1
+            for key in countX[val].keys():
+                ct = countX[val][key]
 
-            # Compute encoded lengths            
-            l_vals     = l_categories[l_categories != 0]
-            r_vals     = r_categories[r_categories != 0]
-            l_tot      = np.sum(l_vals)
-            r_tot      = np.sum(r_vals)
-            l_len      = np.sum(l_vals * ( - np.log2(l_vals / l_tot )))
-            r_len      = np.sum(r_vals * ( - np.log2(r_vals / r_tot )))
-            inaccuracy = l_len + r_len
-                                                               
+                l_categories[key] = l_categories[key] + ct
+                l_tot = l_tot + ct
+
+                r_categories[key] = r_categories[key] - ct
+            
+            r_tot = len(X) - l_tot
+
+            l_len = r_len = 0
+            for tval in l_categories.values():
+                if tval != 0 and l_tot != 0:
+                    l_len = l_len + tval * ( - np.log2(tval / l_tot ))
+            for tval in r_categories.values():
+                if tval != 0 and r_tot != 0:
+                    r_len = r_len + tval * ( - np.log2(tval / r_tot ))
+
+            inaccuracy = l_len + r_len        
+
             # Check if we have found a better spliting point
             if inaccuracy < best_inaccuracy:
                 best_inaccuracy = inaccuracy
                 best_i          = i
 
-        # Check if we have found a good split
-        if best_i is None:
-            return None
-
-        if isNumeric:
-            # Split using the middle point
-            best_value    = (values[best_i] + values[best_i+1]) / 2
-            best_operator = '<'
-        else:
+        if not isNumeric:
             best_value    = values[best_i]
             best_operator = '='                        
+        else:
+            if best_i == (len(values)-1):
+                # No good split has been found
+                return NO_SPLIT_FOUND
+            else:
+                # Split using the middle point
+                best_value    = (values[best_i] + values[best_i+1]) / 2
+                best_operator = '<'                      
 
         # Create the new node
         my_dict = {'inaccuracy': best_inaccuracy,
@@ -1016,52 +1134,65 @@ class NescienceDecisionTree(BaseEstimator):
     """
     Helper function to recursively compute the head of the tree
     """
-    def _head2str(self, node):
+    def _head2str(self, node, column_names=None):
 
         myset = set()
 
         # Print the attribute to take at this level
-        myset.add('X%d' % (node['attribute']+1))
+        if column_names is not None:
+            myset.add(column_names[node['attribute']])            
+        else:
+            myset.add('X%d' % (node['attribute']))
 
         # Process left branch
-        if node['left'] is not None:
-            myset = myset.union(self._head2str(node['left']))
+        if node['left'] != CAN_BE_DEVELOPED and node['left'] != CANNOT_BE_DEVELOPED:
+            myset = myset.union(self._head2str(node['left'], column_names))
     
         # Process right branch    
-        if node['right'] is not None:
-            myset = myset.union(self._head2str(node['right']))
+        if node['right'] != CAN_BE_DEVELOPED and node['right'] != CANNOT_BE_DEVELOPED:
+            myset = myset.union(self._head2str(node['right'], column_names))
                 
         return myset
 
 
     """
     Helper function to recursively compute the body of the tree
-    
-    TODO: String representation of continuous values should be based on discretization
     """
-    def _body2str(self, node, depth):
+    def _body2str(self, node, depth, max_depth=None, column_names=None):
 
         string = ""
 
         # Print the decision to take at this level
-        if node['operator'] == '<':
-            string = string + '%sif X%d %s %.3f:\n' % (' '*depth*4, (node['attribute']+1), node['operator'], node['value'])
+        if column_names is not None:
+            if node['operator'] == '<':
+                string = string + '%sif %s %s %.3f:\n' % (' '*depth*4, (column_names[node['attribute']]), node['operator'], node['value'])
+            else:
+                string = string + '%sif %s %s %s:\n' % (' '*depth*4, (column_names[node['attribute']]), node['operator'], node['value'])
         else:
-            string = string + '%sif X%d %s %s:\n' % (' '*depth*4, (node['attribute']+1), node['operator'], node['value'])
+            if node['operator'] == '<':
+                string = string + '%sif X%d %s %.3f:\n' % (' '*depth*4, (node['attribute']), node['operator'], node['value'])
+            else:
+                string = string + '%sif X%d %s %s:\n' % (' '*depth*4, (node['attribute']), node['operator'], node['value'])
 
         # Process left branch
-        if node['left'] is None:
-            string = string + '%sreturn %s\n' % (' '*(depth+1)*4, self.classes_[node['lforecast']])
+        if max_depth == depth:
+            string = string + '%s[...]\n' % (' '*(depth+1)*4)
         else:
-            string = string + self._body2str(node['left'],  depth+1)
+            if node['left'] == CAN_BE_DEVELOPED or node['left'] == CANNOT_BE_DEVELOPED:
+                string = string + '%sreturn %s\n' % (' '*(depth+1)*4, self.classes_[node['lforecast']])
+            else:
+                string = string + self._body2str(node['left'], depth+1, max_depth, column_names)
     
-        # Process right branch
         string = string + '%selse:\n' % (' '*depth*4)
-    
-        if node['right'] is None:
-            string = string + '%sreturn %s\n' % (' '*(depth+1)*4, self.classes_[node['rforecast']])
+
+        # Process right branch
+        if max_depth == depth:
+            string = string + '%s[...]\n' % (' '*(depth+1)*4)
         else:
-            string = string + self._body2str(node['right'], depth+1)
+            if node['right'] == CAN_BE_DEVELOPED or node['right'] == CANNOT_BE_DEVELOPED:
+                string = string + '%sreturn %s\n' % (' '*(depth+1)*4, self.classes_[node['rforecast']])
+            else:
+                string = string + self._body2str(node['right'], depth+1, max_depth, column_names)
                 
         return string
 
@@ -1069,20 +1200,89 @@ class NescienceDecisionTree(BaseEstimator):
     """
     Convert a tree into a string
     
-    Convert a decision tree into a string using an austere representation
-    Intended to compute the nescience of the tree
+    Convert a decision tree into a string
+
+      * depth - up to which level print the tree
+      * column_names - use column names instead of "X" values
+
+    In case of computing the surfeit of a tree, both values "depth" and
+    "column_names" should be None.
         
     Return a string with a representation of the tree
     """
-    def _tree2str(self):
+    def _tree2str(self, depth=None, column_names=None):
     
         # Compute the tree header
-        string = "def tree" + str(self._head2str(self.root_)) + ":\n"
+        string = "def tree" + str(self._head2str(self.root_, column_names)) + ":\n"
 
         # Compute the tree body
-        string = string + self._body2str(self.root_, 1)
+        string = string + self._body2str(self.root_, 1, depth, column_names)
 
         return string
+
+
+    """
+    Helper function to recursively compute the body of the tree in natural language
+    """
+    def _body2nl(self, node, depth, max_depth=None, column_names=None, categories=None):
+
+        string = ""
+
+        # Print the decision to take at this level
+        if column_names is not None:
+            if node['operator'] == '<':
+                string = string + '%sif %s %s %.3f:\n' % (' '*depth*4, (column_names[node['attribute']]), node['operator'], node['value'])
+            else:
+                string = string + '%sif %s %s %s:\n' % (' '*depth*4, (column_names[node['attribute']]), node['operator'], node['value'])
+        else:
+            if node['operator'] == '<':
+                string = string + '%sif X%d %s %.3f:\n' % (' '*depth*4, (node['attribute']), node['operator'], node['value'])
+            else:
+                string = string + '%sif X%d %s %s:\n' % (' '*depth*4, (node['attribute']), node['operator'], node['value'])
+
+        # Process left branch
+        if max_depth == depth or node['left'] == CAN_BE_DEVELOPED or node['left'] == CANNOT_BE_DEVELOPED:
+            # Check if this branch contains one of the categories in which we are interested
+            if self.classes_[node['lforecast']] in categories:
+                string = string + '%sreturn %s ' % (' '*(depth+1)*4, self.classes_[node['lforecast']])
+                lproba = np.sum(self.y_[node['lindices']] == node["lforecast"]) / len(node['lindices'])
+                string = string + ' with probability %s\n' % (lproba)
+            # else:
+            #    string = string + '%s[...]\n' % (' '*(depth+1)*4)
+        else:
+            string = string + self._body2nl(node['left'], depth+1, max_depth, column_names, categories)
+    
+        string = string + '%selse:\n' % (' '*depth*4)
+
+        # Process right branch
+        if max_depth == depth or node['right'] == CAN_BE_DEVELOPED or node['right'] == CANNOT_BE_DEVELOPED:
+            # Check if this branch contains one of the categories in which we are interested            
+            if self.classes_[node['rforecast']] in categories:
+                string = string + '%sreturn %s ' % (' '*(depth+1)*4, self.classes_[node['rforecast']])
+                rproba = np.sum(self.y_[node['rindices']] == node["rforecast"]) / len(node['rindices'])
+                string = string + ' with probability %s\n' % (rproba)
+            # else:
+            #    string = string + '%s[...]\n' % (' '*(depth+1)*4)
+        else:
+            string = string + self._body2nl(node['right'], depth+1, max_depth, column_names, categories)
+                
+        return string
+
+
+    """
+    Generate a string in natural language
+    
+    Generate a string in natural language with the derivations of the tree
+
+      * categories   - categories in which we are interested
+      * depth        - up to which level print the tree
+      * column_names - use column names instead of "X" values
+        
+    Return a string with a natural language representation of the tree
+    """
+    def _nlg(self, depth=None, column_names=None, categories=None):
+    
+        return self._body2nl(self.root_, 1, depth, column_names, categories)
 
 
     """
@@ -1093,13 +1293,13 @@ class NescienceDecisionTree(BaseEstimator):
         nodes = 1
         
         # Process left branch    
-        if node['left'] is None:
+        if node['left'] == CAN_BE_DEVELOPED or node['left'] == CANNOT_BE_DEVELOPED:
             nodes = nodes + 1
         else:
             nodes = nodes + self._bodycount(node['left'])
     
         # Process right branch    
-        if node['right'] is None:
+        if node['right'] == CAN_BE_DEVELOPED or node['right'] == CANNOT_BE_DEVELOPED:
             nodes = nodes + 1
         else:
             nodes = nodes + self._bodycount(node['right'])
@@ -1125,10 +1325,10 @@ class NescienceDecisionTree(BaseEstimator):
         ldepth = 0
         rdepth = 0
         
-        if node['left'] is not None:
+        if node['left'] != CAN_BE_DEVELOPED and node['left'] != CANNOT_BE_DEVELOPED:
             ldepth = self._bodydepth(node['left'])
         
-        if node['right'] is not None:
+        if node['right'] != CAN_BE_DEVELOPED and node['right'] != CANNOT_BE_DEVELOPED:
             rdepth = self._bodydepth(node['right'])
 
         if ldepth > rdepth:
@@ -1146,7 +1346,6 @@ class NescienceDecisionTree(BaseEstimator):
     
         return(self._bodydepth(self.root_))
 
-
     """
     Clean up a tree removing redundant nodes, that is, nodes where both
     sides forecast the same value
@@ -1157,7 +1356,7 @@ class NescienceDecisionTree(BaseEstimator):
         flag = False
         
         # Check if it is a terminal node
-        if (node['left'] is None) and (node['right'] is None):
+        if (node['left'] == CANNOT_BE_DEVELOPED) and (node['right'] == CANNOT_BE_DEVELOPED):
             # If both sides forecast the same value, clean it up
             if node['lforecast'] == node['rforecast']:
                 if parent is not None:    # Avoid to clean up the root node
@@ -1171,10 +1370,10 @@ class NescienceDecisionTree(BaseEstimator):
                         flag = True
                     
         else:
-            if node['left'] is not None:
+            if node['left'] != CAN_BE_DEVELOPED and node['left'] != CANNOT_BE_DEVELOPED:
                 flag = self._cleanup(node['left'], node, "left")
         
-            if node['right'] is not None:
+            if node['right'] != CAN_BE_DEVELOPED and node['right'] != CANNOT_BE_DEVELOPED:
                 flag2 = self._cleanup(node['right'], node, "right")
                 flag  = flag or flag2
 
@@ -1183,15 +1382,18 @@ class NescienceDecisionTree(BaseEstimator):
 
 class NescienceDecisionTreeClassifier(BaseEstimator, ClassifierMixin):
 
-    def __init__(self, cleanup=True, n_jobs=1, verbose=False):
+    def __init__(self, cleanup=True, partial_miscoding=True, early_stop=True, n_jobs=1, verbose=False):
         """
         Initialization of the tree
 
-          * cleanup(bool)  : If redundant leaf nodes are removed
-          * verbose: Boolean. If true, prints out additional information
+          * cleanup(bool)     : If redundant leaf nodes are removed from final tree
+          * n_jobs (int)      : Number of concurrent jobs
+          * partial_miscoding : use partial miscoding instead of adjusted miscoding
+          * early_stop        : stop the algorithm as soon as a good solution has been found
+          * verbose (bool)    : If True, prints out additional information
         """
 
-        self.tree = NescienceDecisionTree(verbose=verbose, mode="classification", n_jobs=n_jobs)
+        self.tree = NescienceDecisionTree(verbose=verbose, mode="classification", cleanup=cleanup, partial_miscoding=partial_miscoding, early_stop=early_stop, n_jobs=n_jobs)
 
 
     def fit(self, X, y):
@@ -1264,15 +1466,18 @@ class NescienceDecisionTreeClassifier(BaseEstimator, ClassifierMixin):
 
 class NescienceDecisionTreeRegressor(BaseEstimator, RegressorMixin):
 
-    def __init__(self, cleanup=True, n_jobs=1, verbose=False):
+    def __init__(self, cleanup=True, partial_miscoding=True, early_stop=True, n_jobs=1, verbose=False):
         """
         Initialization of the tree
 
-          * cleanup(bool)  : If redundant leaf nodes are removed
-          * verbose: Boolean. If true, prints out additional information
+          * cleanup(bool)     : If redundant leaf nodes are removed from final tree
+          * n_jobs (int)      : Number of concurrent jobs
+          * partial_miscoding : use partial miscoding instead of adjusted miscoding
+          * early_stop        : stop the algorithm as soon as a good solution has been found
+          * verbose (bool)    : If True, prints out additional information
         """
         
-        self.tree = NescienceDecisionTree(verbose=verbose, n_jobs=n_jobs, mode="regression")
+        self.tree = NescienceDecisionTree(verbose=verbose, cleanup=cleanup, partial_miscoding=partial_miscoding, early_stop=early_stop, n_jobs=n_jobs, mode="regression")
 
 
     def fit(self, X, y):
@@ -1341,3 +1546,36 @@ class NescienceDecisionTreeRegressor(BaseEstimator, RegressorMixin):
         """
 
         return(self.tree.score(X, y))
+
+# import cProfile
+
+# import pprofile
+
+# from sklearn.datasets import load_digits
+from sklearn.datasets import fetch_kddcup99
+
+# X, y = load_digits(return_X_y=True)
+X, y = fetch_kddcup99(subset='SA', return_X_y=True)
+X = pd.DataFrame(X)
+
+# X = pd.DataFrame(X)
+# X["Even"] = [val in [0, 2, 4, 6, 8] for val in y]
+#X["Small"] = [val in [0, 1, 2, 3, 4] for val in y]
+
+model = NescienceDecisionTreeClassifier(early_stop=False, verbose=True, n_jobs=1, cleanup=False)
+
+# cProfile.run('model.fit(X, y)', sort='tottime')
+
+# profiler = pprofile.Profile()
+
+# with profiler:
+#    model.fit(X, y)
+
+model.fit(X, y)
+
+# profiler.print_stats()
+# profiler.dump_stats("profiler_stats.txt")
+
+print("Score:", model.score(X,y))
+
+# y_hat = model.predict(X)
