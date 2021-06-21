@@ -34,7 +34,7 @@ NO_SPLIT_FOUND      = -2    # No suitable split has been found for attribute
 CAN_BE_DEVELOPED    = -3    # Node cannot be futher develped
 CANNOT_BE_DEVELOPED = -4    # Node can be developed
 
-DEBUG = True    # Print addtional information
+DEBUG = False    # Print addtional information
 
 class NescienceDecisionTree(BaseEstimator):
     """
@@ -187,7 +187,6 @@ class NescienceDecisionTree(BaseEstimator):
                   "Inaccuracy: ", self._inaccuracy(),
                   "Surfeit: ",    self._surfeit(),
                   "Nescience: ",  self._nescience())
-            print(self._tree2str())
 
         if self.verbose:
             print("Best Nescience:",   self.nescience_)           
@@ -1546,36 +1545,3 @@ class NescienceDecisionTreeRegressor(BaseEstimator, RegressorMixin):
         """
 
         return(self.tree.score(X, y))
-
-# import cProfile
-
-# import pprofile
-
-# from sklearn.datasets import load_digits
-from sklearn.datasets import fetch_kddcup99
-
-# X, y = load_digits(return_X_y=True)
-X, y = fetch_kddcup99(subset='SA', return_X_y=True)
-X = pd.DataFrame(X)
-
-# X = pd.DataFrame(X)
-# X["Even"] = [val in [0, 2, 4, 6, 8] for val in y]
-#X["Small"] = [val in [0, 1, 2, 3, 4] for val in y]
-
-model = NescienceDecisionTreeClassifier(early_stop=False, verbose=True, n_jobs=1, cleanup=False)
-
-# cProfile.run('model.fit(X, y)', sort='tottime')
-
-# profiler = pprofile.Profile()
-
-# with profiler:
-#    model.fit(X, y)
-
-model.fit(X, y)
-
-# profiler.print_stats()
-# profiler.dump_stats("profiler_stats.txt")
-
-print("Score:", model.score(X,y))
-
-# y_hat = model.predict(X)
